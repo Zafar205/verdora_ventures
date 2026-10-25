@@ -1,36 +1,74 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Sustain Agro — Control Dashboard
 
-## Getting Started
+Next.js dashboard for the two water-only sheds (aeroponic `AER-01`, hydroponic `HYD-01`), each with
+three rows. Every shed has three sensor stations (front end, middle, back end), and each station has:
 
-First, run the development server:
+- environment sensors: temperature, humidity, light
+- root-zone sensors: moisture and NPK
+
+The headline value per shed is the average of the valid stations; an alert fires if the stations
+disagree by more than a per-metric limit (likely a bad sensor). Actuators per shed: three row water
+pumps (misting in aeroponic, circulation in hydroponic), a fan and a grow light. The dashboard also has
+alerts, crop-profile limits, command history and an audit log.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm run dev   # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Current state: simulated gateway
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+There is no hardware or AWS link yet, so `lib/gateway.ts` simulates GW-01 (dummy telemetry every 5 s,
+shed physics, local rules such as water the rows below the average-moisture minimum, fan above the temperature limit, switching protection,
+manual override that beats rules). The UI only talks to the `/api/*` routes.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Route | Purpose |
+| --- | --- |
+| `GET /api/state` | Full snapshot (readings, actuators, alerts, audit, permissions) |
+| `GET /api/history?node=AER-01&metric=temp` | Last 30 min for the 3 stations |
+| `POST /api/commands` | `{actuator, action: "on" \| "off" \| "auto"}` |
+| `POST /api/mode` | `{mode: "manual" \| "rule"}` (admin only; ML is advisory and disabled) |
+| `POST /api/profile` | `{shed, metric, min, max}` crop-profile limits |
+| `POST /api/alerts` | `{id}` acknowledge |
 
-## Learn More
+Role permissions (`lib/rbac.ts`) mirror the report's access matrix and are enforced in the API, not
+just by hiding buttons. The role is currently taken from an `x-role` header chosen in the UI —
+**demo auth only**; replace with a verified session/JWT (e.g. Cognito) in `lib/http.ts`.
 
-To learn more about Next.js, take a look at the following resources:
+## Going live
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Re-implement the exported functions of `lib/gateway.ts` against real infrastructure; routes and UI stay as is:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- `snapshot` / `history`: read latest + history from PostgreSQL (fed by AWS IoT Core rule → ingestion service).
+- `sendCommand`: publish to a command topic (e.g. `site/zone/node/cmd`), mark the command `acked` when
+  the gateway's acknowledgement arrives (the simulator fakes this after ~0.9 s).
+- Persist the audit log and profiles in PostgreSQL; the in-memory store here resets on restart.
+- Replace polling with a WebSocket/SSE push if update latency matters.
+- Sensor positions, metrics, actuators and default limits live in `lib/model.ts`; adjust once exact sensor
+  models and actuator wiring are confirmed.
 
-## Deploy on Vercel
+## Surveillance (`/surveillance`)
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Four cameras (entrance + interior per shed), an anomaly list and a detection log. Anomalies:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Door left open**: warning after 60 s, critical after 5 min.
+- **Round check missed**: no completed round in a shed within 60 min (constants in `lib/surveillance.ts`).
+
+The demo starts with the hydroponic round overdue so the alert is visible. The nav badge counts unacknowledged alerts on every page.
+
+**Camera feeds:** set any of `CAM_AER_DOOR_URL`, `CAM_AER_INT_URL`, `CAM_HYD_DOOR_URL`, `CAM_HYD_INT_URL`
+in `.env.local` to an MJPEG/snapshot image URL or an `.mp4`/`.webm` URL. Without one, a simulated feed is shown.
+RTSP/HLS must be converted first (e.g. MediaMTX or go2rtc to MJPEG/WebRTC). Don't put camera passwords in these
+URLs, because the browser receives them; put a proxy in front.
+
+**Connecting your computer-vision service:** have it POST detections as they happen:
+
+```bash
+curl -X POST http://localhost:3000/api/surveillance/events \
+  -H "x-cv-token: $SURVEILLANCE_TOKEN" -H "content-type: application/json" \
+  -d '{"type":"round_completed","shed":"aeroponic","camera":"CAM-AER-INT","confidence":0.92}'
+```
+
+`type` is one of `person_detected`, `round_completed`, `door_open`, `door_closed`. Set `SURVEILLANCE_TOKEN` in
+`.env.local`. Your CV code decides what counts as a "round" (e.g. a person passing all three rows) and sends
+`round_completed`; this app only tracks the timing. In development, operators can also simulate events from the
+page; that path is disabled in production builds.
